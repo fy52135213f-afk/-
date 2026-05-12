@@ -1,1 +1,1014 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+curve_calc.py — 带缓和曲线的圆曲线线路测设计算程序  【v2 修正版】
+============================================================
+功能：数据计算、控制台打印、导出 curve_data.csv
+配合：plot_curve.m（MATLAB R2024b 独立绘图脚本）
+============================================================
+
+【v2 核心修正说明】
+  ─────────────────────────────────────────────────────────
+  ★ 修正方位角来源错误（原始 BUG）：
+      旧代码：az_ZH_JD = azimuth(Xa, Ya, Xjd1, Yjd1)
+              → 用 A→JD1 方位角作为局部坐标系 x' 轴方位角
+              → A、B、JD1 共线时结果偶然正确；非共线时误差可达数度！
+
+      新代码：az_ZH_JD = azimuth(Xa, Ya, Xb, Yb)
+              → 用控制点 A→B 方位角（即测量直线段方向）
+              → 与 JD1 坐标完全解耦，结果始终正确
+
+  ★ 概念辨析（务必区分以下两个量）：
+      · 线路转角 α ：JD1 处线路折转的角度（度分秒输入）
+                      仅用于计算曲线要素（T、L、E0、q）和
+                      推算 JD1 另一侧的出线方位角 az_JD_HZ。
+                      不参与局部坐标 → 大地坐标的旋转矩阵！
+
+      · 方位角 az  ：ZH→JD1 方向的坐标方位角（弧度）
+                      由控制点 A→B 反算得到，是 local_to_geodetic()
+                      旋转矩阵的唯一旋转参数。
+  ─────────────────────────────────────────────────────────
+  ★ 变量命名升级：
+      原 JD  → JD1（起点交点，入线切线与出线切线的交点）
+      JD2 暂未实现（可在多曲线拓展中添加第二个交点）
+  ─────────────────────────────────────────────────────────
+  ★ 其他改动：
+      · local_to_geodetic() 函数体不做任何改动（已验证正确）
+      · 控制点 A/B 输入功能已完整保留（get_input 第1、2步）
+      · 新增 az 对比提示：A→B 与 A→JD1 方位角差值超 0.1° 时警告
+      · 整理了错误排查清单（见文件末尾注释块）
+
+坐标系约定（不变）：
+  · 测量坐标系：X = 北坐标（Northing），Y = 东坐标（Easting）
+  · 坐标方位角：从北方向顺时针量起，α = atan2(ΔY, ΔX)
+  · 局部坐标系：以 ZH 为原点，ZH→JD1 方向为 x' 轴，y' 轴垂直
+      右偏曲线：y' 向右（正值，sign=+1）
+      左偏曲线：y' 向左（正值，sign=−1 后代入公式）
+
+输入已知：控制点 A、B（大地坐标）、交点 JD1（大地坐标）、
+          转角 α（度分秒+左右偏）、圆曲线半径 R、缓和曲线长 l0、
+          直缓点 ZH 里程 DK_ZH（直接已知）
+============================================================
+"""
+
+import math
+import csv
+import sys
+import os
+from collections import defaultdict
+
+# ─────────────────────────────────────────────────────────────────────────────
+PI = math.pi
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 工具函数（完整保留，补充 dms 格式化）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def dms_to_decimal(d: float, m: float, s: float) -> float:
+    """度分秒 → 十进制度（结果非负）"""
+    return abs(d) + abs(m) / 60.0 + abs(s) / 3600.0
+
+
+def decimal_to_dms(deg: float) -> str:
+    """十进制度 → 度分秒格式字符串（°′″）"""
+    deg = abs(deg)
+    d = int(deg)
+    m_f = (deg - d) * 60
+    m = int(m_f)
+    s = (m_f - m) * 60
+    return f"{d:d}°{m:02d}′{s:06.3f}″"
+
+
+def deg2rad(d: float) -> float:
+    return d * PI / 180.0
+
+
+def rad2deg(r: float) -> float:
+    return r * 180.0 / PI
+
+
+def normalize_az(a: float) -> float:
+    """坐标方位角归化至 [0, 2π)"""
+    return a % (2 * PI)
+
+
+def azimuth(X1: float, Y1: float, X2: float, Y2: float) -> float:
+    """
+    两点坐标方位角（弧度，[0, 2π)）
+    测量坐标系：X=北，Y=东
+    公式：α = atan2(ΔY, ΔX)（从北顺时针）
+    """
+    return normalize_az(math.atan2(Y2 - Y1, X2 - X1))
+
+
+def fmt_mileage(K: float) -> str:
+    """格式化里程：K1+234.567"""
+    km = int(K // 1000)
+    m = K - km * 1000
+    return f"K{km}+{m:07.3f}"
+
+
+def sep(char: str = '─', n: int = 76) -> str:
+    return char * n
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 输入模块（内置测试数据 + 交互式输入）
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 内置测试数据（直接回车使用）
+# 注意：已将 Xjd/Yjd 改名为 Xjd1/Yjd1（交点 JD1，即起点处入线/出线的交点）
+DEFAULT = {
+    'Xa':     500.000,
+    'Ya':     200.000,
+    'Xb':     900.000,
+    'Yb':     200.000,
+    'Xjd1':  3200.000,   # ★ v2：原 Xjd → Xjd1
+    'Yjd1':   200.000,   # ★ v2：原 Yjd → Yjd1
+    'alpha_d':   35,
+    'alpha_m':   30,
+    'alpha_s':  0.0,
+    'dir':      'R',
+    'R':       500.0,
+    'l0':      100.0,
+    'DK_ZH':  3220.180,
+}
+
+
+def _ask(prompt: str, default=None):
+    hint = f"（默认 {default}）" if default is not None else ""
+    raw = input(f"  {prompt}{hint}: ").strip()
+    if not raw and default is not None:
+        return str(default)
+    return raw
+
+
+def _ask_float(prompt: str, default=None, min_val=None) -> float:
+    while True:
+        try:
+            raw = _ask(prompt, default)
+            val = float(raw)
+            if min_val is not None and val < min_val:
+                print(f"    ⚠ 必须 ≥ {min_val}，请重新输入")
+                continue
+            return val
+        except ValueError:
+            print("    ⚠ 请输入有效数字")
+        except EOFError:
+            sys.exit(0)
+
+
+def _ask_int(prompt: str, default=None) -> int:
+    while True:
+        try:
+            raw = _ask(prompt, default)
+            return int(raw)
+        except ValueError:
+            print("    ⚠ 请输入整数")
+        except EOFError:
+            sys.exit(0)
+
+
+def get_input() -> dict:
+    """
+    交互式输入全部已知参数
+    已知量：控制点A坐标、控制点B坐标、交点JD1坐标、
+            转角α（度分秒+左右偏）、R、l0、DK_ZH
+
+    【方位角来源说明】
+    · 步骤1、2输入控制点A/B → 由A→B反算入线方位角 az_ZH_JD（核心旋转参数）
+    · 步骤3输入JD1坐标     → 仅用于从JD1沿切线长T反推ZH/HZ大地坐标
+    · 步骤4输入转角α       → 仅用于曲线要素计算和推算出线方位角
+    """
+    D = DEFAULT
+    print()
+    print('╔' + '═' * 76 + '╗')
+    print('║' + '  带缓和曲线的圆曲线线路测设计算程序  【v2 方位角修正版】'.center(76) + '║')
+    print('║' + '  严格按中南大学线路测量教材公式 · 回车使用内置测试数据'.center(76) + '║')
+    print('╚' + '═' * 76 + '╝')
+    print()
+
+    # ── 步骤1：控制点 A（入线直线段起点，用于反算入线方位角）───────────────
+    print('【1】控制点 A 的大地坐标（m）')
+    print('     ↑ A→B 方向将作为 ZH→JD1 方位角的计算依据（局部坐标系 x\' 轴）')
+    Xa = _ask_float('Xa（北坐标）', D['Xa'])
+    Ya = _ask_float('Ya（东坐标）', D['Ya'])
+
+    # ── 步骤2：控制点 B（入线直线段终点，与A一同确定入线方向）───────────────
+    print('\n【2】控制点 B 的大地坐标（m）')
+    print('     ↑ B 在入线切线上，A→B 方位角即为线路 ZH→JD1 方位角')
+    Xb = _ask_float('Xb（北坐标）', D['Xb'])
+    Yb = _ask_float('Yb（东坐标）', D['Yb'])
+
+    if abs(Xa - Xb) < 1e-6 and abs(Ya - Yb) < 1e-6:
+        raise ValueError("控制点 A、B 坐标重合，无法确定入线方向！")
+
+    # 由 A→B 反算入线方位角（这是局部坐标系旋转的核心参数）
+    az_AB = azimuth(Xa, Ya, Xb, Yb)
+    print(f"\n  ✔ 由控制点 A→B 反算入线方位角：{decimal_to_dms(rad2deg(az_AB))}"
+          f"  = {rad2deg(az_AB):.6f}°  = {az_AB:.6f} rad")
+    print(f"     此方位角将用作局部坐标系旋转角（az_ZH_JD），与 JD1 坐标无关。")
+
+    # ── 步骤3：交点 JD1（仅用于反推 ZH/HZ 坐标，不参与旋转矩阵）────────────
+    print('\n【3】交点 JD1 的大地坐标（m）')
+    print('     ↑ 仅用于：ZH = JD1 − T·方向向量，HZ = JD1 + T·方向向量')
+    print('     ↑ 不参与局部→大地坐标转换的旋转矩阵（已由A→B确定）')
+    Xjd1 = _ask_float('Xjd1（北坐标）', D['Xjd1'])
+    Yjd1 = _ask_float('Yjd1（东坐标）', D['Yjd1'])
+
+    # 验证 A→JD1 与 A→B 方位角的差值（超 0.1° 提示，不强制报错）
+    az_A_JD1 = azimuth(Xa, Ya, Xjd1, Yjd1)
+    ang_diff  = abs(rad2deg(az_AB) - rad2deg(az_A_JD1))
+    ang_diff  = min(ang_diff, 360.0 - ang_diff)
+    if ang_diff > 0.1:
+        print(f"\n  ⚠  【方位角对比】")
+        print(f"     A→B  方位角 = {decimal_to_dms(rad2deg(az_AB))}"
+              f"  ({rad2deg(az_AB):.4f}°)  ← 将用于旋转矩阵")
+        print(f"     A→JD1方位角 = {decimal_to_dms(rad2deg(az_A_JD1))}"
+              f"  ({rad2deg(az_A_JD1):.4f}°)")
+        print(f"     偏差 {ang_diff:.4f}° > 0.1°。")
+        print(f"     若 A/B/JD1 理论上共线，请检查输入坐标；")
+        print(f"     本程序以 A→B 方位角为准（测量控制边方向更可靠）。")
+
+    # ── 步骤4：线路转角 α ─────────────────────────────────────────────────
+    print('\n【4】线路转角 α（度分秒格式）')
+    print('     ↑ 转角α = 曲线在 JD1 处的折转角，仅用于：')
+    print('       ① 计算曲线要素（T、L、E0、q）')
+    print('       ② 推算出线方位角 az_JD_HZ = az_ZH_JD ± α')
+    print('       ③ 不参与局部→大地坐标的旋转矩阵！')
+    alpha_d = _ask_int('转角 度', D['alpha_d'])
+    alpha_m = _ask_int('转角 分', D['alpha_m'])
+    alpha_s = _ask_float('转角 秒', D['alpha_s'])
+    alpha_deg = dms_to_decimal(alpha_d, alpha_m, alpha_s)
+    if alpha_deg <= 0:
+        raise ValueError(f"转角 α = {alpha_deg}° 必须 > 0")
+
+    while True:
+        try:
+            dir_raw = _ask('偏转方向（R/右=右偏，L/左=左偏）', D['dir']).upper()
+            if dir_raw in ('R', '右', '右偏'):
+                sign, dir_str = +1, '右偏'
+                break
+            elif dir_raw in ('L', '左', '左偏'):
+                sign, dir_str = -1, '左偏'
+                break
+            else:
+                print("    ⚠ 请输入 R（右偏）或 L（左偏）")
+        except EOFError:
+            sys.exit(0)
+
+    print('\n【5】圆曲线半径 R（m）')
+    R = _ask_float('R（m）', D['R'], min_val=0.001)
+
+    print('\n【6】缓和曲线全长 l0（m）')
+    l0 = _ask_float('l0（m）', D['l0'], min_val=0.001)
+
+    print('\n【7】直缓点 ZH 里程 DK_ZH（m）—— 直接已知，所有主点里程由此基准推算')
+    DK_ZH = _ask_float('DK_ZH（m）', D['DK_ZH'], min_val=0.0)
+
+    return {
+        'Xa': Xa, 'Ya': Ya,
+        'Xb': Xb, 'Yb': Yb,
+        'Xjd1': Xjd1, 'Yjd1': Yjd1,   # ★ v2：JD → JD1
+        'az_AB': az_AB,                  # ★ v2：新增，A→B 反算方位角（弧度）
+        'alpha_deg': alpha_deg,
+        'alpha_d': alpha_d, 'alpha_m': alpha_m, 'alpha_s': alpha_s,
+        'sign': sign,
+        'dir_str': dir_str,
+        'R': R,
+        'l0': l0,
+        'DK_ZH': DK_ZH,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 核心公式函数（local_to_geodetic 函数体完全不改动，已验证正确）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def local_to_geodetic(x_prime: float, y_prime: float,
+                      X0: float, Y0: float,
+                      az: float, sign: int) -> tuple:
+    """
+    局部坐标 → 大地坐标（测量坐标系）
+    教材旋转平移矩阵公式：
+      [X]   [cos az   −sin az] [ x'  ]   [X0]
+      [Y] = [sin az    cos az] [±y'  ] + [Y0]
+    其中 ±y' = sign × y'（右偏 sign=+1，左偏 sign=−1）
+
+    参数说明：
+      x_prime, y_prime — 局部坐标系坐标（ZH 为原点，ZH→JD1 为 x' 轴正方向）
+      X0, Y0           — 原点（ZH 或 HZ 点）的大地坐标
+      az               — 局部坐标系 x' 轴的坐标方位角（弧度）
+                         ★ 必须用 A→B 反算结果，不得用转角 α！
+      sign             — 偏转符号（右偏+1 / 左偏−1）
+
+    【函数体完全不改动，已通过方向向量验证】
+    """
+    y_s = sign * y_prime
+    X = X0 + x_prime * math.cos(az) - y_s * math.sin(az)
+    Y = Y0 + x_prime * math.sin(az) + y_s * math.cos(az)
+    return X, Y
+
+
+def spiral_xy(l: float, R: float, l0: float) -> tuple:
+    """
+    缓和曲线局部坐标（ZH 为原点，ZH→JD1 为 x' 轴）
+    教材实用简化公式（令 C = R·l0）：
+      x = l − l⁵ / (40·R²·l0²)
+      y = l³ / (6·R·l0)
+    参数：l — 计算点到 ZH（或 HZ）的缓和曲线弧长，l ∈ [0, l0]
+    """
+    if abs(l) < 1e-12:
+        return 0.0, 0.0
+    x = l - l**5 / (40.0 * R**2 * l0**2)
+    y = l**3 / (6.0 * R * l0)
+    return x, y
+
+
+def hy_point_xy(l0: float, R: float) -> tuple:
+    """
+    HY 点（令 l = l0）专用坐标公式
+    教材专用公式：
+      x0 = l0 − l0³ / (40·R²)
+      y0 = l0² / (6·R)
+    """
+    x0 = l0 - l0**3 / (40.0 * R**2)
+    y0 = l0**2 / (6.0 * R)
+    return x0, y0
+
+
+def circle_xy(l: float, R: float, l0: float,
+              beta0_rad: float, m: float, p: float) -> tuple:
+    """
+    圆曲线段局部坐标（ZH 为原点，ZH→JD1 为 x' 轴）
+    教材公式：
+      φ = (l − l0)/R + β0        （圆心角，弧度）
+      x = R·sin(φ) + m
+      y = R·(1 − cos(φ)) + p
+    参数：l — 计算点到 ZH 点的总弧长，l ∈ [l0, L−l0]
+    """
+    phi = (l - l0) / R + beta0_rad
+    x = R * math.sin(phi) + m
+    y = R * (1.0 - math.cos(phi)) + p
+    return x, y
+
+
+def _gen_mileages(dk_start: float, dk_end: float, step: float) -> list:
+    """
+    生成里程列表，必须包含起终点（dk_start, dk_end）
+    中间按 step 步长生成 step 整倍数桩
+    """
+    result = [dk_start]
+    dk = math.ceil(dk_start / step) * step
+    if abs(dk - dk_start) < 1e-6:
+        dk += step
+    while dk < dk_end - 1e-6:
+        result.append(dk)
+        dk += step
+    result.append(dk_end)
+    seen = set()
+    unique = []
+    for v in result:
+        key = round(v, 6)
+        if key not in seen:
+            seen.add(key)
+            unique.append(v)
+    return sorted(unique)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 主计算流程
+# ═════════════════════════════════════════════════════════════════════════════
+
+def calculate(inp: dict) -> dict:
+    """
+    按教材公式完成全部计算，返回结果字典
+
+    【v2 修正内容 — 方位角来源】
+    ─────────────────────────────────────────────────────────────────────────
+    旧：az_ZH_JD = azimuth(Xa, Ya, Xjd, Yjd)   ← 用 A→JD 方位角（错误）
+    新：az_ZH_JD = inp['az_AB']                  ← 用 A→B 方位角（正确）
+
+    原因：
+    · A、B 是实测控制点，A→B 严格代表入线切线方向；
+    · JD1 坐标是设计值，与 A/B 未必精确共线；
+    · 局部坐标系的 x' 轴方向由入线切线确定，与 JD1 无关；
+    · JD1 仅用于由切线长 T 反推 ZH/HZ 大地坐标（步骤④后半段）。
+
+    计算流程（步骤编号与原版一致）：
+    ① 缓和曲线基础常数（C、β0、m、p）        ← 公式不变
+    ② 曲线综合要素（T、L、Ly、E0、q）         ← 公式不变
+    ③ 主点里程（全部由 DK_ZH 推算）           ← 公式不变
+    ④ 方位角（★修正来源） & ZH/HZ 大地坐标   ← 来源修正，推算逻辑不变
+    ⑤ 主点局部坐标 & 大地坐标                 ← 公式不变
+    ⑥ 直线段特殊点（每 50m，不含 ZH）         ← 规则不变
+    ⑦ ZH→HY 缓和曲线特殊点（每 10m）         ← 规则不变
+    ⑧ HY→YH 圆曲线特殊点（双向整20m桩）      ← 规则不变
+    ⑨ YH→HZ 缓和曲线特殊点（每 10m）         ← 规则不变
+    """
+    Xa, Ya    = inp['Xa'],   inp['Ya']
+    Xb, Yb    = inp['Xb'],   inp['Yb']
+    Xjd1, Yjd1 = inp['Xjd1'], inp['Yjd1']  # ★ v2：JD → JD1
+    alpha_deg  = inp['alpha_deg']
+    sign       = inp['sign']
+    R          = inp['R']
+    l0         = inp['l0']
+    DK_ZH      = inp['DK_ZH']
+
+    alpha_rad = deg2rad(alpha_deg)
+
+    # ─── ① 缓和曲线基础常数（教材标准公式，不做任何改动）───────────────────
+    C         = R * l0
+    beta0_rad = l0 / (2.0 * R)
+    beta0_deg = rad2deg(beta0_rad)
+    m_val     = l0 / 2.0 - l0**3 / (240.0 * R**2)
+    p_val     = l0**2 / (24.0 * R)
+
+    # ─── ② 曲线综合要素（教材标准公式，不做任何改动）───────────────────────
+    T      = m_val + (R + p_val) * math.tan(alpha_rad / 2.0)
+    L      = l0 + R * alpha_rad
+    Ly     = L - 2.0 * l0
+    E0     = (R + p_val) / math.cos(alpha_rad / 2.0) - R
+    q_val  = 2.0 * T - L
+
+    if Ly <= 1e-6:
+        raise ValueError(
+            f"圆曲线长 Ly = {Ly:.6f} m ≤ 0，缓和曲线过长！\n"
+            f"  请减小 l0（当前 {l0} m）、增大 R（当前 {R} m）或增大 α（当前 {alpha_deg:.4f}°）。"
+        )
+
+    # ─── ③ 主点里程（全部由 DK_ZH 推算，不做任何改动）────────────────────
+    DK_HY  = DK_ZH + l0
+    DK_QZ  = DK_ZH + L / 2.0
+    DK_YH  = DK_ZH + L - l0
+    DK_HZ  = DK_ZH + L
+
+    assert abs(DK_QZ - (DK_ZH + DK_HZ) / 2.0) < 1e-6, "QZ 里程校核失败"
+
+    # ─── ④ 方位角 & ZH/HZ 大地坐标 ──────────────────────────────────────
+    #
+    # ★ v2 核心修正：
+    #   az_ZH_JD（局部坐标系 x' 轴方位角）来自控制点 A→B，
+    #   不再从 A→JD1 计算（两者仅在三点严格共线时相等）。
+    #
+    # 方位角含义梳理：
+    #   az_ZH_JD  = A→B 方位角 = ZH→JD1 切线方向（入线方向）
+    #   az_JD_ZH  = az_ZH_JD + π               （JD1→ZH，即入线反方向）
+    #   az_JD_HZ  = az_ZH_JD + sign·α          （JD1→HZ，即出线方向）
+    #   az_HZ_back= az_JD_HZ + π               （HZ→JD1，用于 YH→HZ 缓和曲线反向展开）
+    #
+    # 注意：sign·α 中 sign=+1（右偏）时出线方位角顺时针增大；
+    #       sign=−1（左偏）时出线方位角逆时针减小（顺时针缩小）。
+    # ─────────────────────────────────────────────────────────────────────
+
+    az_ZH_JD  = inp['az_AB']                             # ★ 修正：来自 A→B，非 A→JD1
+    az_JD_HZ  = normalize_az(az_ZH_JD + sign * alpha_rad)  # 出线方位角
+    az_JD_ZH  = normalize_az(az_ZH_JD + PI)                # JD1→ZH（入线反方向）
+
+    # ZH 坐标：从 JD1 沿入线反方向退 T（切线长）
+    X_ZH = Xjd1 + T * math.cos(az_JD_ZH)
+    Y_ZH = Yjd1 + T * math.sin(az_JD_ZH)
+
+    # HZ 坐标：从 JD1 沿出线方向走 T（切线长）
+    X_HZ = Xjd1 + T * math.cos(az_JD_HZ)
+    Y_HZ = Yjd1 + T * math.sin(az_JD_HZ)
+
+    # 控制点 A 里程（A 在 ZH 前方，DK_A < DK_ZH）
+    dist_A_ZH = math.hypot(X_ZH - Xa, Y_ZH - Ya)
+    DK_A = DK_ZH - dist_A_ZH
+
+    # 控制点 B 里程（B 在入线切线上，A→B→ZH 方向）
+    dist_A_B = math.hypot(Xb - Xa, Yb - Ya)
+    DK_B     = DK_A + dist_A_B
+
+    # ─── ⑤ 主点局部坐标 & 大地坐标（不做任何改动）────────────────────────
+    loc_ZH = (0.0, 0.0)
+    geo_ZH = (X_ZH, Y_ZH)
+
+    loc_HY = hy_point_xy(l0, R)
+    geo_HY = local_to_geodetic(loc_HY[0], loc_HY[1], X_ZH, Y_ZH, az_ZH_JD, sign)
+
+    loc_QZ = circle_xy(L / 2.0, R, l0, beta0_rad, m_val, p_val)
+    geo_QZ = local_to_geodetic(loc_QZ[0], loc_QZ[1], X_ZH, Y_ZH, az_ZH_JD, sign)
+
+    loc_YH = circle_xy(L - l0, R, l0, beta0_rad, m_val, p_val)
+    geo_YH = local_to_geodetic(loc_YH[0], loc_YH[1], X_ZH, Y_ZH, az_ZH_JD, sign)
+
+    # HZ 局部坐标（反算：大地→局部，用于汇总表格局部坐标列）
+    dX_HZ = X_HZ - X_ZH
+    dY_HZ = Y_HZ - Y_ZH
+    x_HZ_loc        = dX_HZ * math.cos(az_ZH_JD) + dY_HZ * math.sin(az_ZH_JD)
+    y_HZ_loc_signed = -dX_HZ * math.sin(az_ZH_JD) + dY_HZ * math.cos(az_ZH_JD)
+    y_HZ_loc        = y_HZ_loc_signed / sign
+    loc_HZ = (x_HZ_loc, y_HZ_loc)
+    geo_HZ = (X_HZ, Y_HZ)
+
+    main_pts = {
+        'ZH': {'DK': DK_ZH, 'loc': loc_ZH, 'geo': geo_ZH},
+        'HY': {'DK': DK_HY, 'loc': loc_HY, 'geo': geo_HY},
+        'QZ': {'DK': DK_QZ, 'loc': loc_QZ, 'geo': geo_QZ},
+        'YH': {'DK': DK_YH, 'loc': loc_YH, 'geo': geo_YH},
+        'HZ': {'DK': DK_HZ, 'loc': loc_HZ, 'geo': geo_HZ},
+    }
+
+    # ─── ⑥ 直线段特殊点（A→ZH，每 50m，不含 ZH，规则不变）────────────────
+    straight_pts = []
+    dk = math.ceil(DK_A / 50.0) * 50.0
+    while dk < DK_ZH - 1e-6:
+        d_to_zh = DK_ZH - dk
+        X_pt = X_ZH - d_to_zh * math.cos(az_ZH_JD)
+        Y_pt = Y_ZH - d_to_zh * math.sin(az_ZH_JD)
+        x_pt_loc = dk - DK_ZH
+        y_pt_loc = 0.0
+        straight_pts.append({'DK': dk, 'loc': (x_pt_loc, y_pt_loc),
+                              'X': X_pt, 'Y': Y_pt})
+        dk += 50.0
+
+    # ─── ⑦ ZH→HY 缓和曲线特殊点（每 10m，含 ZH、HY，规则不变）────────────
+    zh_hy_pts = []
+    for dk in _gen_mileages(DK_ZH, DK_HY, step=10.0):
+        l = dk - DK_ZH
+        x_p, y_p = spiral_xy(l, R, l0)
+        X_p, Y_p = local_to_geodetic(x_p, y_p, X_ZH, Y_ZH, az_ZH_JD, sign)
+        zh_hy_pts.append({'DK': dk, 'loc': (x_p, y_p), 'geo': (X_p, Y_p)})
+
+    # ─── ⑧ HY→YH 圆曲线普通布点（双向整20m桩，不含HY/QZ/YH主点）──────────
+    hy_yh_pts = []
+    circle_dks_hy_side = []
+    circle_dks_yh_side = []
+
+    first_hy = math.ceil(DK_HY / 20.0) * 20.0
+    if abs(first_hy - DK_HY) < 1e-6:
+        first_hy += 20.0
+    dk_iter = first_hy
+    while dk_iter < DK_QZ - 1e-6:
+        circle_dks_hy_side.append(round(dk_iter, 6))
+        dk_iter += 20.0
+
+    first_yh = math.floor(DK_YH / 20.0) * 20.0
+    if abs(first_yh - DK_YH) < 1e-6:
+        first_yh -= 20.0
+    dk_iter = first_yh
+    while dk_iter > DK_QZ + 1e-6:
+        circle_dks_yh_side.append(round(dk_iter, 6))
+        dk_iter -= 20.0
+
+    all_circle_dks = sorted(set(circle_dks_hy_side) | set(circle_dks_yh_side))
+
+    for dk in all_circle_dks:
+        l = dk - DK_ZH
+        x_p, y_p = circle_xy(l, R, l0, beta0_rad, m_val, p_val)
+        X_p, Y_p = local_to_geodetic(x_p, y_p, X_ZH, Y_ZH, az_ZH_JD, sign)
+        hy_yh_pts.append({'DK': dk, 'loc': (x_p, y_p), 'geo': (X_p, Y_p)})
+
+    # ─── ⑨ YH→HZ 缓和曲线特殊点（每 10m，以 HZ 为原点反向，规则不变）──────
+    #
+    # 说明：YH→HZ 段缓和曲线以 HZ 为原点、HZ→JD1 反向为 x' 轴正向展开，
+    #       故原点坐标用 (X_HZ, Y_HZ)，方位角用 az_HZ_back（HZ→JD1反向）。
+    #       sign 取反（-sign）以保持偏转方向一致。
+    #
+    az_HZ_back = normalize_az(az_JD_HZ + PI)
+    yh_hz_pts = []
+    for dk in _gen_mileages(DK_YH, DK_HZ, step=10.0):
+        l = DK_HZ - dk
+        x_p, y_p = spiral_xy(l, R, l0)
+        X_p, Y_p = local_to_geodetic(x_p, y_p, X_HZ, Y_HZ, az_HZ_back, -sign)
+        yh_hz_pts.append({'DK': dk, 'loc': (x_p, y_p), 'geo': (X_p, Y_p)})
+
+    return {
+        'inp': inp,
+        # ① 缓和曲线基础常数
+        'C': C, 'beta0_rad': beta0_rad, 'beta0_deg': beta0_deg,
+        'm': m_val, 'p': p_val,
+        # ② 综合要素
+        'T': T, 'L': L, 'Ly': Ly, 'E0': E0, 'q': q_val,
+        # ③ 主点里程
+        'DK_ZH': DK_ZH, 'DK_HY': DK_HY, 'DK_QZ': DK_QZ,
+        'DK_YH': DK_YH, 'DK_HZ': DK_HZ,
+        # ④ 方位角 & 坐标
+        'az_ZH_JD': az_ZH_JD, 'az_JD_HZ': az_JD_HZ,
+        'az_JD_ZH': az_JD_ZH, 'az_HZ_back': az_HZ_back,
+        'X_ZH': X_ZH, 'Y_ZH': Y_ZH,
+        'X_HZ': X_HZ, 'Y_HZ': Y_HZ,
+        # ⑤ 主点坐标
+        'main_pts': main_pts,
+        # ⑥⑦⑧⑨ 特殊点
+        'DK_A': DK_A, 'DK_B': DK_B,
+        'straight_pts': straight_pts,
+        'zh_hy_pts': zh_hy_pts,
+        'hy_yh_pts': hy_yh_pts,
+        'yh_hz_pts': yh_hz_pts,
+        # 圆曲线双侧布点里程（供控制台核对）
+        'circle_dks_hy_side': circle_dks_hy_side,
+        'circle_dks_yh_side': circle_dks_yh_side,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 输出模块
+# ═════════════════════════════════════════════════════════════════════════════
+
+def print_results(res: dict):
+    inp     = res['inp']
+    R, l0   = inp['R'], inp['l0']
+    sign    = inp['sign']
+    dir_str = inp['dir_str']
+
+    # ── 输入参数确认 ──────────────────────────────────────────────────────────
+    print()
+    print('╔' + '═' * 76 + '╗')
+    print('║' + '  带缓和曲线的圆曲线线路测设计算成果  【v2 方位角修正版】'.center(76) + '║')
+    print('╚' + '═' * 76 + '╝')
+    print()
+    print('【输入参数确认】')
+    print(f"  控制点 A：Xa  = {inp['Xa']:.3f} m，Ya  = {inp['Ya']:.3f} m  （入线直线段起点）")
+    print(f"  控制点 B：Xb  = {inp['Xb']:.3f} m，Yb  = {inp['Yb']:.3f} m  （入线直线段终点）")
+    print(f"  交点 JD1：Xjd1= {inp['Xjd1']:.3f} m，Yjd1= {inp['Yjd1']:.3f} m  （仅用于反推ZH/HZ坐标）")
+    print(f"  线路转角 α = {inp['alpha_d']}°{inp['alpha_m']:02d}′{inp['alpha_s']:.3f}″"
+          f"  = {inp['alpha_deg']:.6f}°  ({dir_str})  ← 仅用于曲线要素和出线方位角")
+    print(f"  圆曲线半径   R  = {R:.3f} m")
+    print(f"  缓和曲线全长 l0 = {l0:.3f} m")
+    print(f"  直缓点ZH里程 DK_ZH = {fmt_mileage(inp['DK_ZH'])}（{inp['DK_ZH']:.3f} m）")
+
+    # ★ v2 新增：方位角来源汇报
+    az_AB_deg = rad2deg(inp['az_AB'])
+    az_JD_deg = rad2deg(res['az_ZH_JD'])
+    az_out_deg = rad2deg(res['az_JD_HZ'])
+    print()
+    print('【v2 方位角汇报（修正核心）】')
+    print(f"  ★ az（ZH→JD1） = A→B 方位角 = {decimal_to_dms(az_AB_deg)}"
+          f"  = {az_AB_deg:.6f}°  ← 旋转矩阵用此值")
+    print(f"     出线方位角  = az + sign·α = {decimal_to_dms(az_out_deg)}"
+          f"  = {az_out_deg:.6f}°")
+    print(f"  ZH 大地坐标：X_ZH = {res['X_ZH']:.6f} m，Y_ZH = {res['Y_ZH']:.6f} m")
+    print(f"  HZ 大地坐标：X_HZ = {res['X_HZ']:.6f} m，Y_HZ = {res['Y_HZ']:.6f} m")
+
+    # ── 【第一步】缓和曲线基础常数 ──────────────────────────────────────────
+    print()
+    print(sep('═'))
+    print('  【第一步】缓和曲线基础常数')
+    print(sep('═'))
+    print()
+    print(f"  缓和曲线常数   C  = R·l0 = {R:.3f} × {l0:.3f}")
+    print(f"                 C  = {res['C']:.6f} m²")
+    print()
+    print(f"  缓和曲线角    β0  = l0 / (2R) = {l0:.3f} / (2 × {R:.3f})")
+    print(f"                β0  = {res['beta0_rad']:.6f} rad")
+    print(f"                    = {res['beta0_deg']:.6f}°")
+    print(f"                    = {decimal_to_dms(res['beta0_deg'])}")
+    print()
+    print(f"  切线增长值     m  = l0/2 − l0³/(240·R²)")
+    print(f"                    = {l0:.3f}/2 − {l0:.3f}³/(240 × {R:.3f}²)")
+    print(f"                 m  = {res['m']:.6f} m")
+    print()
+    print(f"  切线内移值     p  = l0² / (24·R)")
+    print(f"                    = {l0:.3f}² / (24 × {R:.3f})")
+    print(f"                 p  = {res['p']:.6f} m")
+
+    # ── 【第二步】曲线综合要素与全部主点里程 ────────────────────────────────
+    print()
+    print(sep('═'))
+    print('  【第二步】曲线综合要素与全部主点里程')
+    print(sep('═'))
+
+    print()
+    print('  ▶ 2-1  综合要素')
+    print(f"  {'要素':<10} {'符号':<4} {'数值':>18}  {'公式'}")
+    print('  ' + sep('─', 68))
+    print(f"  {'切线长':<10} {'T':<4} {res['T']:>18.6f} m  m + (R+p)·tan(α/2)")
+    print(f"  {'曲线总长':<10} {'L':<4} {res['L']:>18.6f} m  l0 + R·α_rad  （= 2l0 + Ly）")
+    print(f"  {'圆曲线长':<10} {'Ly':<4} {res['Ly']:>18.6f} m  L − 2·l0  = R·(α − 2·β0)")
+    print(f"  {'外矢距':<10} {'E0':<4} {res['E0']:>18.6f} m  (R+p)·sec(α/2) − R")
+    print(f"  {'切曲差':<10} {'q':<4} {res['q']:>18.6f} m  2T − L")
+
+    print()
+    print('  ▶ 2-2  主点里程（以 DK_ZH 为基准推算）')
+    print(f"  {'主点':<6} {'名称':<8} {'桩号':<18} {'里程（m）':>12}  {'推算关系'}")
+    print('  ' + sep('─', 68))
+    dk_map = [
+        ('ZH', '直缓点', res['DK_ZH'], '直接已知'),
+        ('HY', '缓圆点', res['DK_HY'], 'ZH + l0'),
+        ('QZ', '曲中点', res['DK_QZ'], 'ZH + L/2'),
+        ('YH', '圆缓点', res['DK_YH'], 'ZH + L − l0'),
+        ('HZ', '缓直点', res['DK_HZ'], 'ZH + L'),
+    ]
+    for sym, name, dk, rel in dk_map:
+        print(f"  {sym:<6} {name:<8} {fmt_mileage(dk):<18} {dk:>12.3f} m  {rel}")
+    qz_check = (res['DK_ZH'] + res['DK_HZ']) / 2
+    print(f"\n  ✔ 校核：QZ = (ZH + HZ)/2 = {qz_check:.3f} m，"
+          f"差 = {abs(res['DK_QZ'] - qz_check):.6f} m  ✓")
+
+    # ── 【第三步】统一汇总总表格 ────────────────────────────────────────────
+    print()
+    print(sep('═'))
+    print('  【第三步】统一汇总总表格（全部点位合并，按里程排序）')
+    print(sep('═'))
+    print()
+    print(f"  局部坐标系：原点=ZH，x' 轴沿 ZH→JD1 方向（方位角={decimal_to_dms(az_AB_deg)}），"
+          f"y' 轴垂直（{dir_str}取{'正' if sign > 0 else '负'}）")
+    print()
+
+    MAIN_KEYS    = {'ZH', 'HY', 'QZ', 'YH', 'HZ'}
+    CONTROL_KEYS = {'控制点A', '控制点B'}
+    HIGH_PRIO    = MAIN_KEYS | CONTROL_KEYS
+
+    DK_ZH = res['DK_ZH']
+    DK_HY = res['DK_HY']
+    DK_QZ = res['DK_QZ']
+    DK_YH = res['DK_YH']
+    DK_HZ = res['DK_HZ']
+
+    all_rows = []
+
+    all_rows.append({
+        'DK':  res['DK_A'],
+        'typ': '控制点A',
+        'xp':  res['DK_A'] - DK_ZH,
+        'yp':  0.0,
+        'X':   inp['Xa'], 'Y': inp['Ya'],
+        'seg': '线路控制点',
+    })
+
+    all_rows.append({
+        'DK':  res['DK_B'],
+        'typ': '控制点B',
+        'xp':  res['DK_B'] - DK_ZH,
+        'yp':  0.0,
+        'X':   inp['Xb'], 'Y': inp['Yb'],
+        'seg': '线路控制点',
+    })
+
+    for pt in res['straight_pts']:
+        all_rows.append({
+            'DK':  pt['DK'],
+            'typ': '直线桩',
+            'xp':  pt['loc'][0], 'yp': pt['loc'][1],
+            'X':   pt['X'],      'Y':  pt['Y'],
+            'seg': '直线段',
+        })
+
+    for pt in res['zh_hy_pts']:
+        dk = pt['DK']
+        if abs(dk - DK_ZH) < 1e-4 or abs(dk - DK_HY) < 1e-4:
+            continue
+        all_rows.append({
+            'DK':  dk,
+            'typ': '缓和点',
+            'xp':  pt['loc'][0], 'yp': pt['loc'][1],
+            'X':   pt['geo'][0], 'Y':  pt['geo'][1],
+            'seg': '缓和曲线',
+        })
+
+    for pt in res['hy_yh_pts']:
+        all_rows.append({
+            'DK':  pt['DK'],
+            'typ': '圆曲线桩',
+            'xp':  pt['loc'][0], 'yp': pt['loc'][1],
+            'X':   pt['geo'][0], 'Y':  pt['geo'][1],
+            'seg': '圆曲线',
+        })
+
+    for pt in res['yh_hz_pts']:
+        dk = pt['DK']
+        if abs(dk - DK_YH) < 1e-4 or abs(dk - DK_HZ) < 1e-4:
+            continue
+        all_rows.append({
+            'DK':  dk,
+            'typ': '缓和点',
+            'xp':  pt['loc'][0], 'yp': pt['loc'][1],
+            'X':   pt['geo'][0], 'Y':  pt['geo'][1],
+            'seg': '缓和曲线',
+        })
+
+    for name in ['ZH', 'HY', 'QZ', 'YH', 'HZ']:
+        mp = res['main_pts'][name]
+        all_rows.append({
+            'DK':  mp['DK'],
+            'typ': name,
+            'xp':  mp['loc'][0], 'yp': mp['loc'][1],
+            'X':   mp['geo'][0], 'Y':  mp['geo'][1],
+            'seg': '主点',
+        })
+
+    buckets = defaultdict(list)
+    for row in all_rows:
+        key = round(row['DK'], 4)
+        buckets[key].append(row)
+
+    unique_rows = []
+    for key in sorted(buckets.keys()):
+        candidates = buckets[key]
+        main_ones    = [r for r in candidates if r['typ'] in MAIN_KEYS]
+        control_ones = [r for r in candidates if r['typ'] in CONTROL_KEYS]
+        if main_ones:
+            chosen = main_ones[0]
+        elif control_ones:
+            chosen = control_ones[0]
+        else:
+            chosen = candidates[0]
+        unique_rows.append(chosen)
+
+    hdr = (f"  {'桩号里程':<20} {'点类型':<10} {'★':<2}"
+           f"  {'x\'局部（m）':>15}  {'y\'局部（m）':>15}"
+           f"  {'X大地（m）':>15}  {'Y大地（m）':>15}  {'分类'}")
+    print(hdr)
+    print('  ' + sep('─', 115))
+    for row in unique_rows:
+        flag = '★' if row['typ'] in MAIN_KEYS else ' '
+        print(f"  {fmt_mileage(row['DK']):<20} {row['typ']:<10} {flag:<2}"
+              f"  {row['xp']:>15.6f}  {row['yp']:>15.6f}"
+              f"  {row['X']:>15.6f}  {row['Y']:>15.6f}  {row.get('seg','')}")
+
+    n_main    = sum(1 for r in unique_rows if r['typ'] in MAIN_KEYS)
+    n_control = sum(1 for r in unique_rows if r['typ'] in CONTROL_KEYS)
+    n_curve   = sum(1 for r in unique_rows if r.get('seg') in ('缓和曲线', '圆曲线'))
+    n_line    = sum(1 for r in unique_rows if r.get('seg') == '直线段')
+    print()
+    print(f"  合计 {len(unique_rows)} 个点位：★主点 {n_main} 个  |  "
+          f"控制点 {n_control} 个  |  直线桩 {n_line} 个  |  曲线布点 {n_curve} 个")
+
+    hy_side = res['circle_dks_hy_side']
+    yh_side = res['circle_dks_yh_side']
+    print()
+    print(sep('═'))
+    print('  【圆曲线双向整20m桩布点里程核对表】')
+    print(sep('═'))
+    print(f"  HY里程 = {fmt_mileage(DK_HY)}（{DK_HY:.3f} m）")
+    print(f"  QZ里程 = {fmt_mileage(DK_QZ)}（{DK_QZ:.3f} m）  ← 布点不越过此点")
+    print(f"  YH里程 = {fmt_mileage(DK_YH)}（{DK_YH:.3f} m）")
+    print()
+    print(f"  ▶ HY→QZ 方向（{len(hy_side)} 个点）：")
+    if hy_side:
+        for i, dk in enumerate(hy_side, 1):
+            print(f"      {i:2d}. {fmt_mileage(dk)}  ({dk:.3f} m)  [整{int(round(dk/20))*20}m桩 ✓]")
+    else:
+        print("      （HY 至 QZ 之间无整20m布点，圆曲线段过短）")
+    print()
+    print(f"  ▶ YH→QZ 方向（{len(yh_side)} 个点）：")
+    if yh_side:
+        for i, dk in enumerate(sorted(yh_side), 1):
+            print(f"      {i:2d}. {fmt_mileage(dk)}  ({dk:.3f} m)  [整{int(round(dk/20))*20}m桩 ✓]")
+    else:
+        print("      （YH 至 QZ 之间无整20m布点，圆曲线段过短）")
+    print()
+    all_circle = sorted(set(hy_side) | set(yh_side))
+    print(f"  合计圆曲线普通布点 {len(all_circle)} 个（双侧合并去重）")
+    print(sep('═'))
+    print()
+
+    return unique_rows
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § CSV 导出（UTF-8 无BOM，新字段格式）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def export_csv(unique_rows: list, res: dict, filename: str = 'curve_data.csv'):
+    """
+    导出 curve_data.csv
+    ─────────────────────────────────────────────────────────────────────────
+    编码：UTF-8 无BOM（禁止 utf-8-sig，MATLAB R2024b detectImportOptions 可直接读取）
+
+    固定字段：里程,点类型,局部x,局部y,大地X,大地Y,分类
+
+    分类标签规则（5种，MATLAB 颜色区分）：
+      · 线路控制点  — 直线起点A、直线终点B（从 CSV 读取，不再硬编码）
+      · 直线段      — 入线直线段 50m 布点
+      · 缓和曲线    — ZH→HY、YH→HZ 缓和曲线 10m 布点
+      · 圆曲线      — HY→YH 双向整20m桩布点
+      · 主点        — ZH、HY、QZ、YH、HZ
+    """
+    MAIN_KEYS = {'ZH', 'HY', 'QZ', 'YH', 'HZ'}
+
+    SEG_LABEL = {
+        '线路控制点': '线路控制点',
+        '直线段':     '直线段',
+        '缓和曲线':   '缓和曲线',
+        '圆曲线':     '圆曲线',
+        '主点':       '主点',
+    }
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    filepath   = os.path.join(script_dir, filename)
+
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['里程', '点类型', '局部x', '局部y', '大地X', '大地Y', '分类'])
+        for row in unique_rows:
+            seg   = row.get('seg', '')
+            label = SEG_LABEL.get(seg, seg)
+            writer.writerow([
+                f"{row['DK']:.4f}",
+                row['typ'],
+                f"{row['xp']:.6f}",
+                f"{row['yp']:.6f}",
+                f"{row['X']:.6f}",
+                f"{row['Y']:.6f}",
+                label,
+            ])
+
+    count_map = defaultdict(int)
+    for row in unique_rows:
+        count_map[SEG_LABEL.get(row.get('seg', ''), '其他')] += 1
+
+    print(f"  ✔ CSV 已导出：{filepath}")
+    print(f"    共 {len(unique_rows)} 行，编码：UTF-8（无BOM）")
+    print(f"    字段：里程, 点类型, 局部x, 局部y, 大地X, 大地Y, 分类")
+    print(f"    分类统计：", end='')
+    for lbl, cnt in sorted(count_map.items()):
+        print(f"  {lbl}={cnt}", end='')
+    print()
+    print()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 主函数
+# ═════════════════════════════════════════════════════════════════════════════
+
+def main():
+    try:
+        inp  = get_input()
+        print('\n  计算中……')
+        res  = calculate(inp)
+        rows = print_results(res)
+        print('  正在导出 curve_data.csv……')
+        export_csv(rows, res)
+        print('  全部完成！请打开 MATLAB R2024b 运行 plot_curve.m 生成图形。')
+        print()
+    except ValueError as e:
+        print(f'\n  ❌ 参数错误：{e}\n')
+        sys.exit(1)
+    except AssertionError as e:
+        print(f'\n  ❌ 校核失败：{e}\n')
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('\n  已中断。\n')
+        sys.exit(0)
+    except Exception as e:
+        print(f'\n  ❌ 意外错误：{e}')
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 错误排查清单（Error Checklist）
+# ═════════════════════════════════════════════════════════════════════════════
+"""
+【快速定位方位角/符号/坐标错误的排查步骤】
+
+Q1. 所有大地坐标都偏了一个固定角度？
+    → 检查 az_ZH_JD 的来源：
+      · 必须是 A→B 方位角（azimuth(Xa,Ya,Xb,Yb)）
+      · 不能是转角 α（deg2rad(alpha_deg)）或 A→JD1 方位角
+      · 快速验证：打印 az_ZH_JD，与手算 arctan2(Yb-Ya, Xb-Xa) 核对
+
+Q2. 曲线向错误方向偏转（左偏变右偏或反之）？
+    → 检查 sign 符号：右偏 sign=+1，左偏 sign=-1
+    → local_to_geodetic 中 y_s = sign * y_prime，符号已验证正确
+    → 检查 az_JD_HZ = az_ZH_JD + sign*alpha_rad（出线方位角）
+
+Q3. ZH/HZ 坐标错误（其他主点的局部坐标正确）？
+    → 检查 JD1→ZH 计算：X_ZH = Xjd1 + T*cos(az_JD_ZH)
+      · az_JD_ZH = az_ZH_JD + π（入线反方向，JD1→ZH）
+      · T 必须是曲线要素切线长，不是任意距离
+    → 检查 JD1→HZ 计算：X_HZ = Xjd1 + T*cos(az_JD_HZ)
+      · az_JD_HZ = az_ZH_JD + sign*α（出线方向）
+
+Q4. HY/QZ/YH 局部坐标正确，但大地坐标错误？
+    → 局部→大地转换出错，检查 local_to_geodetic 调用参数：
+      · X0, Y0 必须是 ZH 点大地坐标（或 HZ 点）
+      · az 必须是 az_ZH_JD（或 az_HZ_back）
+      · 不能传入转角 α_rad
+
+Q5. YH→HZ 缓和曲线坐标错误？
+    → 此段以 HZ 为原点反向展开，注意：
+      · 原点：(X_HZ, Y_HZ)
+      · 方位角：az_HZ_back = az_JD_HZ + π（HZ→JD1反向）
+      · sign 取反：-sign
+
+Q6. 如何验算单个点坐标？
+    步骤：
+    ① 用教材公式手算该点局部坐标 (x', y')
+    ② 用 local_to_geodetic(x', y', X_ZH, Y_ZH, az_ZH_JD, sign) 得大地坐标
+    ③ 与输出表格对比
+    ④ 若不符，先查 az_ZH_JD 值是否正确，再查 sign 符号
+
+【方位角与转角的核心区别总结】
+┌──────────┬──────────────────────────────┬──────────────────────────────┐
+│          │ 线路转角 α                    │ 方位角 az                    │
+├──────────┼──────────────────────────────┼──────────────────────────────┤
+│ 定义     │ JD1 处线路的折转角（0~180°） │ ZH→JD1 方向的坐标方位角      │
+│ 单位     │ 度分秒（输入）或弧度（计算） │ 弧度（[0,2π)）               │
+│ 来源     │ 实测/设计给定               │ 由 A→B 坐标反算              │
+│ 用途     │ 计算 T、L、E0、q            │ local_to_geodetic 旋转矩阵   │
+│          │ 推算出线方位角 az_JD_HZ     │ 推算 ZH/HZ 大地坐标          │
+│ 能否替代 │ ❌ 不能替代方位角            │ ❌ 不能替代转角               │
+└──────────┴──────────────────────────────┴──────────────────────────────┘
+"""
 
